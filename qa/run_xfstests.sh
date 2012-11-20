@@ -40,6 +40,7 @@ FS_TYPE="xfs"
 SCRATCH_DEV=""	# MUST BE SPECIFIED
 TEST_DEV=""	# MUST BE SPECIFIED
 TESTS="-g auto"	# The "auto" group is supposed to be "known good"
+XFSTESTS_DIR_SUFFIX=""
 
 # rbd presents geometry information that causes mkfs.xfs to
 # issue a warning.  This option avoids this class of problems.
@@ -159,6 +160,8 @@ function usage() {
 	echo "            name of device used for scratch filesystem" >&2
 	echo "        -t or --test-dev        (REQUIRED)" >&2
 	echo "            name of device used for test filesystem" >&2
+	echo "        -x or --xfstests-suffix" >&2
+	echo "            suffix for directory where xfstests are installed" >&2
 	echo "    tests:" >&2
 	echo "        list of test numbers or ranges, e.g.:" >&2
 	echo "            1-9 11-15 17 19-21 26-28 31-34 41" >&2
@@ -181,6 +184,7 @@ function parseargs() {
 	SHORT_OPTS="${SHORT_OPTS},f:"
 	SHORT_OPTS="${SHORT_OPTS},s:"
 	SHORT_OPTS="${SHORT_OPTS},t:"
+	SHORT_OPTS="${SHORT_OPTS},x:"
 
 	# Short option flags
 	LONG_OPTS=""
@@ -189,6 +193,7 @@ function parseargs() {
 	LONG_OPTS="${LONG_OPTS},fs-type:"
 	LONG_OPTS="${LONG_OPTS},scratch-dev:"
 	LONG_OPTS="${LONG_OPTS},test-dev:"
+	LONG_OPTS="${LONG_OPTS},xfstests-suffix:"
 
 	TEMP=$(getopt --name "${PROGNAME}" \
 		--options "${SHORT_OPTS}" \
@@ -225,6 +230,10 @@ function parseargs() {
 				TEST_DEV="$2"
 				shift
 				;;
+			-x|--xfstests-suffix)
+				XFSTESTS_DIR_SUFFIX="$2"
+				shift
+				;;
 			*)
 				exit 100	# Internal error
 				;;
@@ -258,7 +267,7 @@ export XFS_MKFS_OPTIONS="${XFS_MKFS_OPTIONS:--f -l su=65536}"
 export EXT4_MKFS_OPTIONS="${EXT4_MKFS_OPTIONS:--F}"
 export BTRFS_MKFS_OPTION	# No defaults
 
-XFSTESTS_DIR="/var/lib/xfstests"	# Where the tests live
+XFSTESTS_DIR="/var/lib/xfstests${XFSTESTS_DIR_SUFFIX}"	# Where the tests live
 TEST_ROOT="/tmp/cephtest"		# Files, etc. will be created here
 
 # download, build, and install xfstests
