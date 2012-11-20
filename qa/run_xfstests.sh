@@ -41,6 +41,7 @@ SCRATCH_DEV=""	# MUST BE SPECIFIED
 TEST_DEV=""	# MUST BE SPECIFIED
 TESTS="-g auto"	# The "auto" group is supposed to be "known good"
 XFSTESTS_DIR_SUFFIX=""
+TEST_ROOT="/tmp/cephtest"		# Files, etc. will be created here
 
 # rbd presents geometry information that causes mkfs.xfs to
 # issue a warning.  This option avoids this class of problems.
@@ -156,6 +157,8 @@ function usage() {
 	echo "        -f or --fs-type" >&2
 	echo "            one of: xfs, ext4, btrfs" >&2
 	echo "            (default fs-type: xfs)" >&2
+	echo "        -r or --test-root" >&2
+	echo "            where to put files used to run the tests" >&2
 	echo "        -s or --scratch-dev     (REQUIRED)" >&2
 	echo "            name of device used for scratch filesystem" >&2
 	echo "        -t or --test-dev        (REQUIRED)" >&2
@@ -182,6 +185,7 @@ function parseargs() {
 	SHORT_OPTS="${SHORT_OPTS},h"
 	SHORT_OPTS="${SHORT_OPTS},c:"
 	SHORT_OPTS="${SHORT_OPTS},f:"
+	SHORT_OPTS="${SHORT_OPTS},r:"
 	SHORT_OPTS="${SHORT_OPTS},s:"
 	SHORT_OPTS="${SHORT_OPTS},t:"
 	SHORT_OPTS="${SHORT_OPTS},x:"
@@ -193,6 +197,7 @@ function parseargs() {
 	LONG_OPTS="${LONG_OPTS},fs-type:"
 	LONG_OPTS="${LONG_OPTS},scratch-dev:"
 	LONG_OPTS="${LONG_OPTS},test-dev:"
+	LONG_OPTS="${LONG_OPTS},test-root:"
 	LONG_OPTS="${LONG_OPTS},xfstests-suffix:"
 
 	TEMP=$(getopt --name "${PROGNAME}" \
@@ -216,6 +221,10 @@ function parseargs() {
 				fs_type_valid "$2" ||
 					usage "invalid fs_type '$2'"
 				FS_TYPE="$2"
+				shift
+				;;
+			-r|--test-root)
+				TEST_ROOT="$2"
 				shift
 				;;
 			-s|--scratch-dev)
@@ -268,7 +277,6 @@ export EXT4_MKFS_OPTIONS="${EXT4_MKFS_OPTIONS:--F}"
 export BTRFS_MKFS_OPTION	# No defaults
 
 XFSTESTS_DIR="/var/lib/xfstests${XFSTESTS_DIR_SUFFIX}"	# Where the tests live
-TEST_ROOT="/tmp/cephtest"		# Files, etc. will be created here
 
 # download, build, and install xfstests
 function install_xfstests() {
