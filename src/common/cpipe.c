@@ -12,7 +12,7 @@
  *
  */
 
-#include "common/pipe.h"
+#include "common/cpipe.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -20,7 +20,7 @@
 
 int pipe_cloexec(int pipefd[2])
 {
-#if defined(O_CLOEXEC) && !defined(__FreeBSD__)
+#if defined(O_CLOEXEC) && !defined(__FreeBSD__) && !defined(__APPLE__)
 	int ret;
 	ret = pipe2(pipefd, O_CLOEXEC);
 	if (ret) {

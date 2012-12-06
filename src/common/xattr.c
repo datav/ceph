@@ -19,7 +19,7 @@
 #elif defined(__linux__)
 #include <sys/types.h>
 #include <sys/xattr.h>
-#elif defined(DARWIN)
+#elif defined(__APPLE__) || defined(DARWIN)
 #include <sys/xattr.h>
 #else
 #error "Your system is not supported!"

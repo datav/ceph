@@ -1,6 +1,8 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 m4_include(m4/acx_pthread.m4)
+m4_include(m4/ax_cxx_static_cast.m4)
+m4_include(m4/ax_c_var_func.m4)
 
 # Autoconf
 AC_PREREQ(2.59)
@@ -76,11 +78,17 @@ AC_DEFUN([AC_CHECK_CC_FLAG],
 AC_CHECK_CC_FLAG([-Wtype-limits], [WARN_TYPE_LIMITS])
 AC_CHECK_CC_FLAG([-Wignored-qualifiers], [WARN_IGNORED_QUALIFIERS])
 
+# Checks for static_cast<> feature
+AX_CXX_STATIC_CAST
+
+# Checks for __func__
+AX_C_VAR_FUNC
+
 # Checks for libraries.
 ACX_PTHREAD
-AC_CHECK_LIB([uuid], [uuid_parse], [true], AC_MSG_FAILURE([libuuid not found]))
+AC_CHECK_LIB([System], [uuid_parse], [true], AC_MSG_FAILURE([libuuid not found]))
 AC_CHECK_LIB([m], [pow], [true], AC_MSG_FAILURE([libm not found]))
-AC_CHECK_LIB([resolv], [__res_nquery], [true], AC_MSG_FAILURE([libresolv not found]))
+AC_CHECK_LIB([resolv], [res_query], [true], AC_MSG_FAILURE([libresolv not found]))
 if test x"$linux" = x"yes"; then
 	AC_CHECK_LIB([keyutils], [add_key], [true], AC_MSG_FAILURE([libkeyutils not found]))
 fi
@@ -224,7 +232,7 @@ AC_ARG_WITH([fuse],
             [with_fuse=yes])
 LIBFUSE=
 AS_IF([test "x$with_fuse" != xno],
-	    [AC_CHECK_LIB([fuse], [fuse_main],
+	    [AC_CHECK_LIB([fuse4x], [fuse_main],
              [AC_SUBST([LIBFUSE], ["-lfuse"])
                AC_DEFINE([HAVE_LIBFUSE], [1],
                          [Define if you have fuse])

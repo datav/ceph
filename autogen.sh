@@ -14,7 +14,7 @@ check_for_pkg_config() {
 rm -f config.cache
 aclocal #-I m4
 check_for_pkg_config
-libtoolize --force --copy
+glibtoolize --force --copy
 autoconf
 autoheader
 automake -a --add-missing -Wall
