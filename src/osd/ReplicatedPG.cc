@@ -614,7 +614,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
 {
   MOSDOp *m = (MOSDOp*)op->request;
   assert(m->get_header().type == CEPH_MSG_OSD_OP);
-  if (m->includes_pg_op()) {
+  if (op->includes_pg_op()) {
     if (pg_op_must_wait(m)) {
       wait_for_all_missing(op);
       return;
@@ -622,13 +622,13 @@ void ReplicatedPG::do_op(OpRequestRef op)
     return do_pg_op(op);
   }
 
-  dout(10) << "do_op " << *m << (m->may_write() ? " may_write" : "") << dendl;
+  dout(10) << "do_op " << *m << (op->may_write() ? " may_write" : "") << dendl;
 
   hobject_t head(m->get_oid(), m->get_object_locator().key,
 		 CEPH_NOSNAP, m->get_pg().ps(),
 		 info.pgid.pool());
 
-  if (scrubber.block_writes && m->may_write()) {
+  if (scrubber.block_writes && op->may_write()) {
     // classic (non chunk) scrubs block all writes
     // chunky scrubs only block writes to a range
     if (!scrubber.is_chunky || (head >= scrubber.start && head < scrubber.end)) {
@@ -646,7 +646,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
   }
 
   // degraded object?
-  if (m->may_write() && is_degraded_object(head)) {
+  if (op->may_write() && is_degraded_object(head)) {
     wait_for_degraded_object(head, op);
     return;
   }
@@ -665,7 +665,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
   }
 
   // degraded object?
-  if (m->may_write() && is_degraded_object(snapdir)) {
+  if (op->may_write() && is_degraded_object(snapdir)) {
     wait_for_degraded_object(snapdir, op);
     return;
   }
@@ -673,7 +673,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
   entity_inst_t client = m->get_source_inst();
 
   ObjectContext *obc;
-  bool can_create = m->may_write();
+  bool can_create = op->may_write();
   snapid_t snapid;
   int r = find_object_context(
     hobject_t(m->get_oid(), 
@@ -713,7 +713,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
 		     << " op " << *m << "\n";
   }
 
-  if ((m->may_read()) && (obc->obs.oi.lost)) {
+  if ((op->may_read()) && (obc->obs.oi.lost)) {
     // This object is lost. Reading from it returns an error.
     dout(20) << __func__ << ": object " << obc->obs.oi.soid
 	     << " is lost" << dendl;
@@ -726,12 +726,12 @@ void ReplicatedPG::do_op(OpRequestRef op)
   bool ok;
   dout(10) << "do_op mode is " << mode << dendl;
   assert(!mode.wake);   // we should never have woken waiters here.
-  if ((m->may_read() && m->may_write()) ||
+  if ((op->may_read() && op->may_write()) ||
       (m->get_flags() & CEPH_OSD_FLAG_RWORDERED))
     ok = mode.try_rmw(client);
-  else if (m->may_write())
+  else if (op->may_write())
     ok = mode.try_write(client);
-  else if (m->may_read())
+  else if (op->may_read())
     ok = mode.try_read(client);
   else
     assert(0);
@@ -742,7 +742,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
     return;
   }
 
-  if (!m->may_write() && !obc->obs.exists) {
+  if (!op->may_write() && !obc->obs.exists) {
     osd->reply_op_error(op, -ENOENT);
     put_object_context(obc);
     return;
@@ -837,7 +837,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
   ctx->obc = obc;
   ctx->src_obc = src_obc;
 
-  if (m->may_write()) {
+  if (op->may_write()) {
     // snap
     if (pool.info.is_pool_snaps_mode()) {
       // use pool's snapc
@@ -917,7 +917,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
   uint64_t old_size = obc->obs.oi.size;
   eversion_t old_version = obc->obs.oi.version;
 
-  if (m->may_read()) {
+  if (op->may_read()) {
     dout(10) << " taking ondisk_read_lock" << dendl;
     obc->ondisk_read_lock();
   }
@@ -928,7 +928,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
 
   int result = prepare_transaction(ctx);
 
-  if (m->may_read()) {
+  if (op->may_read()) {
     dout(10) << " dropping ondisk_read_lock" << dendl;
     obc->ondisk_read_unlock();
   }
@@ -988,7 +988,7 @@ void ReplicatedPG::do_op(OpRequestRef op)
     return;
   }
 
-  assert(m->may_write());
+  assert(op->may_write());
 
   // trim log?
   calc_trim_to();
@@ -1014,7 +1014,8 @@ void ReplicatedPG::do_op(OpRequestRef op)
 
 void ReplicatedPG::log_op_stats(OpContext *ctx)
 {
-  MOSDOp *m = (MOSDOp*)ctx->op->request;
+  OpRequestRef op = ctx->op;
+  MOSDOp *m = (MOSDOp*)op->request;
 
   utime_t now = ceph_clock_now(g_ceph_context);
   utime_t latency = now;
@@ -1035,17 +1036,17 @@ void ReplicatedPG::log_op_stats(OpContext *ctx)
   osd->logger->inc(l_osd_op_inb, inb);
   osd->logger->tinc(l_osd_op_lat, latency);
 
-  if (m->may_read() && m->may_write()) {
+  if (op->may_read() && op->may_write()) {
     osd->logger->inc(l_osd_op_rw);
     osd->logger->inc(l_osd_op_rw_inb, inb);
     osd->logger->inc(l_osd_op_rw_outb, outb);
     osd->logger->tinc(l_osd_op_rw_rlat, rlatency);
     osd->logger->tinc(l_osd_op_rw_lat, latency);
-  } else if (m->may_read()) {
+  } else if (op->may_read()) {
     osd->logger->inc(l_osd_op_r);
     osd->logger->inc(l_osd_op_r_outb, outb);
     osd->logger->tinc(l_osd_op_r_lat, latency);
-  } else if (m->may_write()) {
+  } else if (op->may_write()) {
     osd->logger->inc(l_osd_op_w);
     osd->logger->inc(l_osd_op_w_inb, inb);
     osd->logger->tinc(l_osd_op_w_rlat, rlatency);
