@@ -1,0 +1,16 @@
+#!/bin/sh
+#
+# Helper to mount ceph-fuse from /etc/fstab.  To use, add an entry
+# like:
+#
+# # DEVICE                     PATH         TYPE   OPTIONS
+# /sbin/ceph-fuse-mount#admin  /mnt/ceph    ceph   defaults   0 0
+#
+# where 'admin' can be replaced with the client id to use when
+# authenticating (if it is not client.admin).  This will also control
+# which section of ceph.conf will be applied to the ceph-fuse process.
+
+set -e
+id="$1"
+shift
+exec ceph-fuse -i $id $@

@@ -334,6 +334,7 @@ fi
 %defattr(-,root,root,-)
 %{_bindir}/ceph-fuse
 %{_mandir}/man8/ceph-fuse.8*
+/sbin/ceph-fuse-mount
 
 #################################################################################
 %files devel
