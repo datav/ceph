@@ -7,9 +7,16 @@
 #include "rgw_common.h"
 #include "rgw_tools.h"
 
+#include "rgw_rados.h"
+
+#include "rgw_string.h"
+
 using namespace std;
 
 #define RGW_USER_ANON_ID "anonymous"
+
+#define SECRET_KEY_LEN 40
+#define PUBLIC_ID_LEN 20
 
 /**
  * A string wrapper that includes encode/decode functions
@@ -19,7 +26,7 @@ struct RGWUID
 {
   string user_id;
   void encode(bufferlist& bl) const {
-     ::encode(user_id, bl);
+    ::encode(user_id, bl);
   }
   void decode(bufferlist::iterator& bl) {
     ::decode(user_id, bl);
@@ -75,7 +82,7 @@ class RGWUserBuckets
 public:
   RGWUserBuckets() {}
   void encode(bufferlist& bl) const {
-     ::encode(buckets, bl);
+    ::encode(buckets, bl);
   }
   void decode(bufferlist::iterator& bl) {
     ::decode(buckets, bl);
@@ -139,9 +146,268 @@ extern int rgw_remove_user_bucket_info(RGWRados *store, string user_id, rgw_buck
 
 /*
  * remove the different indexes
-  */
+ */
 extern int rgw_remove_key_index(RGWRados *store, RGWAccessKey& access_key);
 extern int rgw_remove_uid_index(RGWRados *store, string& uid);
 extern int rgw_remove_email_index(RGWRados *store, string& email);
 extern int rgw_remove_swift_name_index(RGWRados *store, string& swift_name);
+
+enum
+{
+  RGW_USER_ID_UID,
+  RGW_USER_ID_EMAIL,
+  RGW_USER_ID_SWIFT_NAME,
+  RGW_USER_ID_ACCESS_KEY,
+  RGW_ANONYMOUS_USER
+};
+
+enum ObjectKeyType {
+  KEY_TYPE_SWIFT,
+  KEY_TYPE_S3,
+};
+
+static bool char_is_unreserved_url(char c)
+{
+  if (isalnum(c))
+    return true;
+
+  switch (c) {
+  case '-':
+  case '.':
+  case '_':
+  case '~':
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool validate_access_key(string& key)
+{
+  const char *p = key.c_str();
+  while (*p) {
+    if (!char_is_unreserved_url(*p))
+      return false;
+    p++;
+  }
+  return true;
+}
+
+static int remove_object(RGWRados *store, rgw_bucket& bucket, std::string& object)
+{
+  int ret = -EINVAL;
+  RGWRadosCtx *rctx = new RGWRadosCtx(store);
+  rgw_obj obj(bucket,object);
+
+  ret = store->delete_obj(rctx, obj);
+
+  return ret;
+}
+
+static int remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children)
+{
+  int ret;
+  map<RGWObjCategory, RGWBucketStats> stats;
+  std::vector<RGWObjEnt> objs;
+  std::string prefix, delim, marker, ns;
+  map<string, bool> common_prefixes;
+  rgw_obj obj;
+  RGWBucketInfo info;
+  bufferlist bl;
+
+  ret = store->get_bucket_stats(bucket, stats);
+  if (ret < 0)
+    return ret;
+
+  obj.bucket = bucket;
+  int max = 1000;
+
+  ret = rgw_get_obj(store, NULL, store->params.domain_root, bucket.name, bl, NULL);
+
+  bufferlist::iterator iter = bl.begin();
+  try {
+    ::decode(info, iter);
+  } catch (buffer::error& err) {
+    //cerr << "ERROR: could not decode buffer info, caught buffer::error" << std::endl;
+    return -EIO;
+  }
+
+  if (delete_children) {
+    ret = store->list_objects(bucket, max, prefix, delim, marker, objs, common_prefixes,
+                              false, ns, (bool *)false, NULL);
+    if (ret < 0)
+      return ret;
+
+    while (objs.size() > 0) {
+      std::vector<RGWObjEnt>::iterator it = objs.begin();
+      for (it = objs.begin(); it != objs.end(); it++) {
+        ret = remove_object(store, bucket, (*it).name);
+        if (ret < 0)
+          return ret;
+      }
+      objs.clear();
+
+      ret = store->list_objects(bucket, max, prefix, delim, marker, objs, common_prefixes,
+                                false, ns, (bool *)false, NULL);
+      if (ret < 0)
+        return ret;
+    }
+  }
+
+  ret = store->delete_bucket(bucket);
+  if (ret < 0) {
+    //cerr << "ERROR: could not remove bucket " << bucket.name << std::endl;
+
+    return ret;
+  }
+
+  ret = rgw_remove_user_bucket_info(store, info.owner, bucket);
+  if (ret < 0) {
+    //cerr << "ERROR: unable to remove user bucket information" << std::endl;
+  }
+
+  return ret;
+}
+
+
+/* new functionality */
+class RGWUser;
+
+class RGWAccessKeyPool 
+{
+  std::map<std::string, int, ltstr_nocase> key_type_map;
+  std::string user_id;
+  RGWRados *store;
+  RGWUser *user;
+
+  // we don't want to allow keys for the anonymous user or a null user
+  bool keys_allowed;
+
+private:
+  bool get_key_type(std::string requested_type, int &dest);
+
+  bool create_key(map<string, string> key_attrs);
+  bool generate_key(map<string, string> key_attrs);
+  bool modify_key(map<string, string> key_attrs);
+
+public:
+
+  RGWAccessKeyPool(RGWUser *user);
+
+  bool add(map<string, string> key_attrs, bool defer_save);
+  bool remove(map<string, string> key_attrs, bool defer_save);
+};
+
+class RGWSubUserPool
+{
+  string user_id;
+  RGWRados *store;
+  RGWUser *user;
+  bool subusers_allowed;
+
+  map<string, RGWSubUser> *subuser_map;
+
+public:
+
+  RGWSubUserPool(RGWUser *rgw_user);
+
+  bool add(map<string, string> params, bool defer_save);
+  bool remove(map<string, string> params, bool defer_save);
+  bool modify(map<string, string> params, bool defer_save);
+};
+
+//class RGWUserCaps
+//{
+//  map<string, uint32_t> caps;
+//
+//  int get_cap(const string& cap, string& type, uint32_t *perm);
+//  int parse_cap_perm(const string& str, uint32_t *perm);
+//  int add_cap(const string& cap);
+//  int remove_cap(const string& cap);
+//public:
+//  int add_from_string(const string& str);
+//  int remove_from_string(const string& str);
+//
+//  void encode(bufferlist& bl) const {
+//     ENCODE_START(1, 1, bl);
+//     ::encode(caps, bl);
+//     ENCODE_FINISH(bl);
+//  }
+//  void decode(bufferlist::iterator& bl) {
+//     DECODE_START(1, bl);
+//     ::decode(caps, bl);
+//     DECODE_FINISH(bl);
+//  }
+//  int check_cap(const string& cap, uint32_t perm);
+//  void dump(Formatter *f) const;
+//};
+//WRITE_CLASS_ENCODER(RGWUserCaps);
+
+
+class RGWUserCapPool
+{
+
+  RGWUser *user;
+  RGWUserCaps *caps;
+  bool caps_allowed;
+  
+private:
+public:
+
+  RGWUserCapPool(RGWUser *user);
+  ~RGWUserCapPool();
+
+  bool add(const string& str);
+  bool remove(const string& str);
+};
+
+
+
+class RGWUser
+{
+
+private:
+  RGWUserInfo user_info;
+  RGWRados *store;
+
+  map<string, RGWAccessKey> *access_keys;
+  map<string, RGWAccessKey> *swift_keys;
+
+  string user_id;
+  bool failure;
+
+  void set_failure() { failure = true; };
+
+public:
+  RGWUser(RGWRados *_store, pair<string, string> user);
+  RGWUser(RGWRados *_store );
+  RGWUser();
+  
+  /* API Contracted Members */
+  RGWUserCapPool *caps;
+  RGWAccessKeyPool *keys;
+  RGWSubUserPool *subusers;
+
+  /* API Contracted Methods */
+  bool add(map<string,string> attrs);
+  bool remove(map<string, string> params);
+  bool modify(map<string,string> attrs);
+  bool info (map<string, string> identification, RGWUserInfo &fetched_info);
+
+  friend class RGWAccessKeyPool;
+  friend class RGWSubUserPool;
+  friend class RGWUserCapPool;
+};
+
+
+
+
+
+
+
+
+
+
+
+
 #endif
