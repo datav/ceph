@@ -442,389 +442,669 @@ int rgw_delete_user(RGWRados *store, RGWUserInfo& info) {
 
 /* new functionality */
 
+static bool char_is_unreserved_url(char c)
+{
+  if (isalnum(c))
+    return true;
+
+  switch (c) {
+  case '-':
+  case '.':
+  case '_':
+  case '~':
+    return true;
+  default:
+    return false;
+  }
+}
+
+// define as static when changes complete
+bool validate_access_key(string& key)
+{
+  const char *p = key.c_str();
+  while (*p) {
+    if (!char_is_unreserved_url(*p))
+      return false;
+    p++;
+  }
+  return true;
+}
+
+// define as static when changes complete
+int remove_object(RGWRados *store, rgw_bucket& bucket, std::string& object)
+{
+  int ret = -EINVAL;
+  RGWRadosCtx rctx(store);
+
+  rgw_obj obj(bucket,object);
+
+  ret = store->delete_obj((void *)&rctx, obj);
+  
+  return ret;
+}
+
+// define as static when changes complete
+int remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children)
+{
+  int ret;
+  map<RGWObjCategory, RGWBucketStats> stats;
+  std::vector<RGWObjEnt> objs;
+  std::string prefix, delim, marker, ns;
+  map<string, bool> common_prefixes;
+  rgw_obj obj;
+  RGWBucketInfo info;
+  bufferlist bl;
+
+  ret = store->get_bucket_stats(bucket, stats);
+  if (ret < 0)
+    return ret;
+
+  obj.bucket = bucket;
+  int max = 1000;
+
+  ret = rgw_get_obj(store, NULL, store->params.domain_root,\
+           bucket.name, bl, NULL);
+
+  bufferlist::iterator iter = bl.begin();
+  try {
+    ::decode(info, iter);
+  } catch (buffer::error& err) {
+    //cerr << "ERROR: could not decode buffer info, caught buffer::error" << std::endl;
+    return -EIO;
+  }
+
+  if (delete_children) {
+    ret = store->list_objects(bucket, max, prefix, delim, marker,\
+            objs, common_prefixes,\
+            false, ns, (bool *)false, NULL);
+
+    if (ret < 0)
+      return ret;
+
+    while (objs.size() > 0) {
+      std::vector<RGWObjEnt>::iterator it = objs.begin();
+      for (it = objs.begin(); it != objs.end(); it++) {
+        ret = remove_object(store, bucket, (*it).name);
+        if (ret < 0)
+          return ret;
+      }
+      objs.clear();
+
+      ret = store->list_objects(bucket, max, prefix, delim, marker, objs, common_prefixes,
+                                false, ns, (bool *)false, NULL);
+      if (ret < 0)
+        return ret;
+    }
+  }
+
+  ret = store->delete_bucket(bucket);
+  if (ret < 0) {
+    //cerr << "ERROR: could not remove bucket " << bucket.name << std::endl;
+
+    return ret;
+  }
+
+  ret = rgw_remove_user_bucket_info(store, info.owner, bucket);
+  if (ret < 0) {
+    //cerr << "ERROR: unable to remove user bucket information" << std::endl;
+  }
+
+  return ret;
+}
+
+static bool remove_old_indexes(RGWRados *store,\
+         RGWUserInfo& old_info, RGWUserInfo& new_info, std::string &err_msg)
+{
+  int ret;
+  bool success = true;
+
+  if (!old_info.user_id.empty() && old_info.user_id.compare(new_info.user_id) != 0) {
+    ret = rgw_remove_uid_index(store, old_info.user_id);
+    if (ret < 0 && ret != -ENOENT) {
+      err_msg =  "ERROR: could not remove index for uid " + old_info.user_id;
+      success = false;
+    }
+  }
+
+  if (!old_info.user_email.empty() &&
+      old_info.user_email.compare(new_info.user_email) != 0) {
+    ret = rgw_remove_email_index(store, old_info.user_email);
+  if (ret < 0 && ret != -ENOENT) {
+      err_msg = "ERROR: could not remove index for email " + old_info.user_email;
+      success = false;
+    }
+  }
+
+  map<string, RGWAccessKey>::iterator old_iter;
+  for (old_iter = old_info.swift_keys.begin(); old_iter != old_info.swift_keys.end(); ++old_iter) {
+    RGWAccessKey& swift_key = old_iter->second;
+    map<string, RGWAccessKey>::iterator new_iter = new_info.swift_keys.find(swift_key.id);
+    if (new_iter == new_info.swift_keys.end()) {
+      ret = rgw_remove_swift_name_index(store, swift_key.id);
+      if (ret < 0 && ret != -ENOENT) {
+        err_msg =  "ERROR: could not remove index for swift_name " + swift_key.id;
+        success = false;
+      }
+    }
+  }
 
 
-RGWAccessKeyPool::RGWAccessKeyPool(RGWUser *user) {
 
-  if (!user) {
+  return success;
+}
+
+static bool get_key_type(std::string requested_type,\
+         int &dest, string &err_msg)
+{
+  if (strcasecmp(requested_type.c_str(), "swift") == 0) {
+    dest = KEY_TYPE_SWIFT;
+  } else if (strcasecmp(requested_type.c_str(), "s3") == 0) {
+    dest = KEY_TYPE_S3;
+  } else {
+    err_msg = "bad key type";
+    return false;
+  }
+
+  return true;
+}
+
+
+bool rgw_build_user_request_from_map(map<std::string,\
+         std::string> request_params, RGWUserAdminRequest &_req,\
+         std::string &err_msg)
+{
+  int ret = 0;
+
+  map<std::string, std::string>::iterator it;
+  //std::string subprocess_msg;
+  RGWUserInfo duplicate_info;
+
+  RGWUserAdminRequest req;
+
+  /* do access key related building */
+  
+  // see if a key type was specified
+  it = request_params.find("key_type");
+  if (it != request_params.end()) {
+    req.type_specified = get_key_type(it->second, req.key_type, err_msg);
+    if (!req.type_specified)
+      return false;
+  }
+
+  // see if the access key or secret keys was specified
+  it = request_params.find("access_key");
+  if (it != request_params.end())
+    req.id = it->first;
+  
+  it = request_params.find("secret_key");
+  if (it != request_params.end())
+    req.key = it->second;
+
+  // get some other possible parameters
+  it = request_params.find("gen_secret");
+  if (it != request_params.end())
+    req.gen_secret = str_to_bool(it->second.c_str(), 0);
+
+  it = request_params.find("gen_access");
+  if (it != request_params.end())
+    req.gen_access = str_to_bool(it->second.c_str(), 0);
+
+  /* do subuser related building */
+  
+  it = request_params.find("subuser");
+  if (it != request_params.end())
+    req.subuser = it->second;
+ 
+  it = request_params.find("access");
+  if (it != request_params.end()) {
+    ret = stringtoul((it->second).c_str(), &req.perm_mask);
+    if (ret < 0) {
+      err_msg = "unable to parse perm mask";
+      return false;
+    }
+    req.perm_specified = true;
+  }
+
+  /* user related building */
+
+  it = request_params.find("user_id");
+  if (it != request_params.end()) 
+    req.user_id = it->second;
+
+  it = request_params.find("user_email");
+  if (it != request_params.end())
+    req.user_email = it->second;
+    
+  it = request_params.find("display_name");
+  if (it != request_params.end())
+    req.display_name = it->second;
+    
+  // assume that if this was passed we are doing enable/disable op
+  it = request_params.find("suspended");
+  if (it != request_params.end()) {
+
+    req.suspension_op = true;
+    int suspended = str_to_bool(it->second.c_str(), -1);
+    if (suspended < 0) {
+      err_msg = "unable to parse suspension information";
+      return false;
+    }
+
+    if (suspended)
+      req.is_suspended = 1;
+
+    else
+      req.is_suspended = 0;   
+  }
+
+  it = request_params.find("max_buckets");
+  if (it != request_params.end()) {
+    req.max_buckets_specified = true;
+    
+    ret = stringtoul(it->second, &req.max_buckets);
+    if (ret < 0) {
+      err_msg = "unable to parse max buckets information";
+    return false;
+    }
+  }
+
+  return true;
+}
+
+RGWAccessKeyPool::RGWAccessKeyPool(RGWUser *user)
+{
+  if (!user || user->failure) {
     keys_allowed = false;
     return;
   }
 
   store = user->store;
 
-  // if the user id hasn't been set the user id hasn't been initialized yet or is anonymous
-  if (user->user_id == RGW_USER_ANON_ID) {
+  if (user->user_id == RGW_USER_ANON_ID || !user->populated) {
     keys_allowed = false;
     return;
   }
 
   user_id = user->user_id;
+  swift_keys = &(user->user_info.swift_keys);
+  access_keys = &(user->user_info.access_keys);
 }
 
-bool RGWAccessKeyPool::get_key_type(std::string requested_type, int &dest) {
-  std::map<std::string, int, ltstr_nocase> key_type_map;
+RGWAccessKeyPool::~RGWAccessKeyPool()
+{
 
-  key_type_map["swift"] = KEY_TYPE_SWIFT;
-  key_type_map["s3"] = KEY_TYPE_S3;
+}
 
-  if (!key_type_map.count(requested_type))
+bool RGWAccessKeyPool::check_existing_key(RGWUserAdminRequest req)
+{
+  if (req.id.empty())
     return false;
 
-  dest = key_type_map[requested_type];
+  // if the key type was specified, great...
+  if (req.key_type == KEY_TYPE_SWIFT) {
+    req.existing_key = user->user_info.swift_keys.count(req.id);
+
+    // see if the user made a mistake with the access key
+    if (!req.subuser.empty() && !req.existing_key) {
+      string access_key = req.subuser;
+      access_key.append(":");
+      access_key.append(req.id);
+      req.existing_key = user->user_info.swift_keys.count(req.id);
+
+      if (req.existing_key)
+        req.id = access_key;
+    }
+  }
+
+  if (req.key_type == KEY_TYPE_S3) {
+    req.existing_key = user->user_info.access_keys.count(req.id);
+  }
+
+  /*
+   * ... if not since there is nothing preventing an S3 key from having a colon
+   * we have to traverse both access key maps
+   */
+
+  // try the swift keys first
+  if (!req.type_specified && !req.existing_key) {
+    req.existing_key = swift_keys->count(req.id);
+
+    if (req.existing_key)
+      req.key_type = KEY_TYPE_SWIFT;
+  }
+
+  if (!req.type_specified && !req.existing_key) {
+    req.existing_key = access_keys->count(req.id);
+
+    if (req.existing_key)
+      req.key_type = KEY_TYPE_S3;
+  }
+
+  if (req.existing_key)
+    return true;
+
+  return false;
+}
+
+bool RGWAccessKeyPool::check_request(RGWUserAdminRequest req,\
+     std::string &err_msg)
+{
+  bool found;
+  string subprocess_msg;
+
+  if (!user->populated) {
+    found = user->init(req);
+     if (!found) {
+       err_msg = "unable to initialize user";
+       return false;
+     }
+  }
+
+  /* see if the access key or secret key was specified */
+  if (req.id_specified && req.id.empty()) {
+    err_msg = "empty access key";
+    return false;
+  }
+
+  if (req.key_specified && req.key.empty()) {
+    err_msg = "empty secret key";
+    return false;
+  }
+
+  if (req.key_type == KEY_TYPE_SWIFT && !req.id_specified) {
+    if (req.subuser.empty()) {
+      err_msg = "swift key creation requires a subuser to be specified";
+      return false;
+    }
+  }
+
+  if (req.subuser_specified && req.subuser.empty()) {
+    err_msg = "empty subuser";
+    return false;
+  }
+
+  // check that the subuser exists
+  if (req.subuser_specified && !user->subusers->exists(req.subuser)) {
+    err_msg = "subuser does not exist";
+    return false;
+  }
+
+  // one day it will be safe to force subusers to have swift keys
+  //if (req.subuser_specified)
+  //  req.key_type = KEY_TYPE_SWIFT;
+
+  check_existing_key(req);
+
+  // if a key type wasn't specified set it to s3
+  if (req.key_type != KEY_TYPE_S3 && req.key_type != KEY_TYPE_SWIFT)
+    req.key_type = KEY_TYPE_S3;
+
+  if (!keys_allowed) {
+    err_msg = "keys not allowed for this user";
+    return false;
+  }
 
   return true;
 }
 
-// create a key from passed parameters
-bool RGWAccessKeyPool::create_key(map<string, string> key_attrs) {
 
-  string id;
-  string key;
-  string subuser;
-  bool type_found = false;
+/*
+// marked for deletion....
+// create a key from passed parameters
+bool RGWAccessKeyPool::create_key(RGWUserAdminRequest req, std::string &err_msg)
+{
+  bool duplicate;
 
   RGWAccessKey new_key;
   RGWUserInfo duplicate_check;
 
-  int key_type = KEY_TYPE_S3; // default to S3
+  int key_type = KEY_TYPE_S3;
 
   if (!keys_allowed)
     return false;
 
-  if (!key_attrs.count("id"))
+  if (!req.id_specified)
     return false;
 
-  id = key_attrs["id"];
-
-  if (!key_attrs.count("key"))
-    return false;
-
-  key = key_attrs["key"];
-
-  if (key_attrs.count("subuser"))
-    subuser = key_attrs["subuser"];
-
-  if (key_attrs.count("key_type"))
-    type_found = get_key_type(key_attrs["key_type"], key_type);
-
-  if (key_attrs.count("key_type") && !type_found)
-    return false;
-  
+  if (!req.key_specified)
+    return false
 
   // check that the access key is valid
-  if (key_type == KEY_TYPE_S3 && !validate_access_key(id))
+  if (req.key_type == KEY_TYPE_S3 && !validate_access_key(req.id)) {
+    err_msg = "invalid access key";
     return false;
-
-  // force subusers to have swift keys
-  if (!subuser.empty()) {
-    key_type = KEY_TYPE_SWIFT;
-    new_key.subuser = subuser;
   }
 
-  // check for invalid characters in an S3 key
-  if (key_type == KEY_TYPE_S3 && !validate_access_key(key))
-    return false;
+  // force subusers to have swift keys
+  if (req.subuser_specified) {
+    req.key_type = KEY_TYPE_SWIFT;
+    new_key.subuser = req.subuser;
+  }
 
   // validate a SWIFT access key
-  if (key_type == KEY_TYPE_SWIFT) {
-    string swift_access = user_id;
+  if (req.key_type == KEY_TYPE_SWIFT) {
+    std::string swift_access = user_id;
     swift_access.append(":");
     swift_access.append(subuser);
 
     // check that we're adding the swift key to the right user
-    if (strcmp(swift_access.c_str(), id.c_str()) != 0)
-      return false;
+    if (strcmp(swift_access.c_str(), req.id.c_str()) != 0) {
+       err_msg = "invalid swift access key: " + req.id;
+       return false;
+    }
   }
 
   // check that the key isn't a duplicate
-  if (key_type == KEY_TYPE_S3) {
-    if (rgw_get_user_info_by_access_key(store, id, duplicate_check))
-      return false;
-  } else if (key_type == KEY_TYPE_SWIFT) {
-    if (rgw_get_user_info_by_swift(store, id, duplicate_check))
-      return false;
+  if (req.key_type == KEY_TYPE_S3)
+    if (rgw_get_user_info_by_access_key(store, req.id, duplicate_check))
+      duplicate = true;
+
+  else if (req.key_type == KEY_TYPE_SWIFT)
+    if (rgw_get_user_info_by_swift(store, req.id, duplicate_check))
+      duplicate = true;
+
+  if (duplicate) {
+    err_msg = "cannot create duplicate key";
+    return false;
   }
 
-  new_key.id = id;
-  new_key.key = key;
+  new_key.id = req.id;
+  new_key.key = req.key;
 
-  if (key_type == KEY_TYPE_S3)
-    user->user_info.access_keys[id] = new_key;
-  else if (key_type == KEY_TYPE_SWIFT)
-    user->user_info.swift_keys[id] = new_key;
+  if (req.key_type == KEY_TYPE_S3)
+    user->user_info.access_keys[req.id] = new_key;
+  else if (req.key_type == KEY_TYPE_SWIFT)
+    user->user_info.swift_keys[req.id] = new_key;
 
   return true;
 }
+*/
 
 // Generate a new random key
-bool RGWAccessKeyPool::generate_key(map<string, string> key_attrs) {
-
-  string id;
-  string key;
-  string subuser;
-  string duplicate_check_id;
-  bool access_supplied;
-  bool secret_supplied;
-  bool type_found = false;
+bool RGWAccessKeyPool::generate_key(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string duplicate_check_id;
+  std::string id;
+  std::string key;
+  std::string subuser;
 
   RGWAccessKey new_key;
   RGWUserInfo duplicate_check;
 
-  int ret = -1;
-  int key_type = KEY_TYPE_S3; // default to S3
+  int ret;
+  bool duplicate = false;
 
   if (!keys_allowed)
     return false;
 
-  if (key_attrs.count("key_type"))
-    type_found = get_key_type(key_attrs["key_type"], key_type);
+  if (req.id_specified)
+    id = req.id;
 
-  if (key_attrs.count("key_type") && !type_found)
-    return false;
-  
-  if (key_attrs.count("subuser"))
-    subuser = key_attrs["subuser"];
-
-  if (key_attrs.count("id"))
-    id = key_attrs["id"];  
-
-  if (!id.empty())
-    access_supplied = true;
-
-  if (key_attrs.count("key"))
-    key = key_attrs["key"];
-
-  if (!key.empty())
-    secret_supplied = true;
+  if (req.key_specified)
+    key = req.key;
 
   // this isn't a modify key operation, return error if the key exists
-  if (access_supplied && key_type == KEY_TYPE_S3)
-    ret = rgw_get_user_info_by_access_key(store, id, duplicate_check);
+  if (req.id_specified && req.key_type == KEY_TYPE_S3)
+    duplicate = (rgw_get_user_info_by_access_key(store, req.id, duplicate_check) >= 0);
 
-  if (access_supplied && key_type == KEY_TYPE_SWIFT)
-    ret = rgw_get_user_info_by_swift(store, id, duplicate_check);
+  else if (req.id_specified && req.key_type == KEY_TYPE_SWIFT)
+    duplicate = (rgw_get_user_info_by_swift(store, id, duplicate_check) >= 0);
 
-  // ret should be < 0 if not set in the previous two commands
-  if (ret >= 0)
+  if (duplicate) {
+    err_msg = "cannot create duplicate access key: " + req.id;
     return false;
-
-  // check that the subuser exists
-  if (!subuser.empty() && !user->user_info.subusers.count(subuser))
-    return false;
-
-  // force subusers to have swift keys
-  if (!subuser.empty()) {
-    key_type = KEY_TYPE_SWIFT;
-    new_key.subuser = subuser;
   }
 
+  if (req.subuser_specified)
+    new_key.subuser = req.subuser;
+
+
   // Generate the secret key
-  if (!secret_supplied) {
+  if (!req.key_specified) {
     char secret_key_buf[SECRET_KEY_LEN + 1];
 
     ret = gen_rand_base64(g_ceph_context, secret_key_buf, sizeof(secret_key_buf));
-    if (ret < 0)
+    if (ret < 0) {
+      err_msg = "unable to generate secret key";
       return false;
+    }
 
     key = secret_key_buf;
   }
 
   // Generate the access key
-  if (key_type == KEY_TYPE_S3 && !access_supplied) {
+  if (req.key_type == KEY_TYPE_S3 && !req.id_specified) {
     char public_id_buf[PUBLIC_ID_LEN + 1];
 
     do {
-      ret = gen_rand_alphanumeric_upper(g_ceph_context, public_id_buf, sizeof(public_id_buf));
-      if (ret < 0)
+      int id_buf_size = sizeof(public_id_buf);
+      ret = gen_rand_alphanumeric_upper(g_ceph_context,\
+               public_id_buf, id_buf_size);
+
+      if (ret < 0) {
+        err_msg = "unable to generate access key";
         return false;
+      }
 
       id = public_id_buf;
-      duplicate_check_id = id;
-    } while (!rgw_get_user_info_by_access_key(store, duplicate_check_id, duplicate_check));
+      if (!validate_access_key(id))
+        continue;
+
+    } while (!rgw_get_user_info_by_access_key(store, id, duplicate_check));
   }
 
-  if (key_type == KEY_TYPE_SWIFT && !access_supplied) {
+  if (req.key_type == KEY_TYPE_SWIFT && !req.id_specified) {
     id = user_id;
     id.append(":");
     id.append(subuser);
 
     // check that the access key doesn't exist
-    if (rgw_get_user_info_by_swift(store, id, duplicate_check))
+    if (rgw_get_user_info_by_swift(store, id, duplicate_check)) {
+      err_msg = "duplicate access key: " + id;
       return false;
+    }
   }
-
-  // check that the access key is valid
-  if (key_type == KEY_TYPE_S3 && !validate_access_key(id))
-    return false;
 
   // finally create the new key
   new_key.id = id;
   new_key.key = key;
 
-  if (key_type == KEY_TYPE_S3)
+  if (req.key_type == KEY_TYPE_S3)
     user->user_info.access_keys[id] = new_key;
-  else if (key_type == KEY_TYPE_SWIFT)
+  else if (req.key_type == KEY_TYPE_SWIFT)
     user->user_info.swift_keys[id] = new_key;
 
   return true;
 }
 
 // modify an existing key
-bool RGWAccessKeyPool::modify_key(map<string, string> key_attrs) {
-  string id;
-  string key;
-  int key_type;
- // bool found;
-  bool secret_supplied;
-  bool type_found = false;
+bool RGWAccessKeyPool::modify_key(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string id;
+  std::string key;
   RGWAccessKey modify_key;
 
-  map<string, RGWAccessKey>::iterator kiter;
+  pair<string, RGWAccessKey> key_pair;
+  map<std::string, RGWAccessKey>::iterator kiter;
 
-  if (key_attrs.count("key_type"))
-    type_found = get_key_type(key_attrs["key_type"], key_type);
-
-  if (key_attrs.count("key_type") && !type_found)
+  if (!req.id_specified) {
+    err_msg = "no access key specified";
     return false;
+  }
 
-  if (key_attrs["id"].empty())
+  if (!req.existing_key) {
+    err_msg = "key does not exist";
     return false;
+  }
 
-  id = key_attrs["id"];
+  key_pair.first = req.id;
 
-  if (key_type == KEY_TYPE_SWIFT) 
-    modify_key = user->user_info.swift_keys[id];
-  
-  if (key_type == KEY_TYPE_S3) 
-    modify_key = user->user_info.access_keys[id];
-  
-  if (!key_attrs.count("key"))
-    secret_supplied = false;
+  if (req.key_type == KEY_TYPE_SWIFT) {
+    kiter = swift_keys->find(req.id);
+    modify_key = kiter->second;
+  }
 
-  if (!secret_supplied) {
+  if (req.key_type == KEY_TYPE_S3) {
+    kiter = access_keys->find(req.id);
+    modify_key = kiter->second;
+  }
+
+  if (!req.key_specified) {
     char secret_key_buf[SECRET_KEY_LEN + 1];
 
-    int ret = gen_rand_base64(g_ceph_context, secret_key_buf, sizeof(secret_key_buf));
-    if (ret < 0)
+    int ret;
+    int key_buf_size = sizeof(secret_key_buf);
+    ret  = gen_rand_base64(g_ceph_context, secret_key_buf, key_buf_size);
+    if (ret < 0) {
+      err_msg = "unable to generate secret key";
       return false;
+    }
 
     key = secret_key_buf;
   } else {
-    key = key_attrs["key"];
-    if (key.empty())
+    key = req.key;
+  }
+
+  if (key.empty()) {
+      err_msg = "empty secret key";
       return false;
   }
 
+
   // update the access key with the new secret key
   modify_key.key = key;
+  key_pair.second = modify_key;
+
+
+  if (req.key_type == KEY_TYPE_S3)
+    access_keys->insert(key_pair);
+
+  else if (req.key_type == KEY_TYPE_SWIFT)
+    swift_keys->insert(key_pair);
 
   return true;
 }
 
-// select whether to create a key from passed parameters or to generate a new key
-bool RGWAccessKeyPool::add(map<string, string> key_attrs, bool defer_save) {
-  map<string, string> passed_key_attrs;
-  int op;
-  int ret = 0;
-  int found_key_type;
-  bool key_type_specified;
-  bool exisitng_key = false;
+bool RGWAccessKeyPool::execute_add(RGWUserAdminRequest req,\
+         std::string &err_msg, bool defer_save)
+{
   bool created;
-  string access_key;
-  string secret_key;
+  bool updated = true;
 
-  enum {
-    CREATE_KEY,
-    GENERATE_KEY,
-    MODIFY_KEY
-  };
+  std::string subprocess_msg;
 
-  // see if a key type was specified
-  if (key_attrs.count("key_type")) {
-    if (!get_key_type(key_attrs["key_type"], found_key_type))
-      return false;
+  int op = GENERATE_KEY;
 
-    key_type_specified = true;
-  }
-  
-
-  // try and find the key first
-  if (key_attrs.count("access_key")) {
-
-    access_key = key_attrs["access_key"];
-
-    // if the key type was specified, great...
-    if (found_key_type == KEY_TYPE_SWIFT) {
-      exisitng_key = user->user_info.swift_keys.count(access_key);
-    }
-
-    if (found_key_type == KEY_TYPE_S3) {
-      exisitng_key = user->user_info.access_keys.count(access_key);
-    }
-
-    /*
-     * ... if not since there is nothing preventing an S3 key from having a colon
-     * we have to traverse both access key maps
-     */
-
-    // try the swift keys first
-    if (!key_type_specified && !exisitng_key) {
-      exisitng_key = user->user_info.swift_keys.count(access_key);
-
-      if (exisitng_key)
-        found_key_type = KEY_TYPE_SWIFT;
-    }
-
-    if (!key_type_specified && !exisitng_key) {
-      exisitng_key = user->user_info.access_keys.count(access_key);
-
-      if (exisitng_key)
-        found_key_type = KEY_TYPE_S3;
-    }
-    
-  }
-  
-  if (exisitng_key)
+  // set the op
+  if (req.existing_key)
     op = MODIFY_KEY;
 
-  if (!exisitng_key && key_attrs.count("access_key") && key_attrs.count("secret_key"))
-    op = CREATE_KEY;
-
-  if (key_attrs.count("gen_secret") && key_attrs.count("gen_access"))
-    op = GENERATE_KEY;
-
-  if (!exisitng_key && !key_attrs.count("access_key") && !key_attrs.count("secret_key"))
-    op = GENERATE_KEY;
-  
-
-  // build the list of attributes to pass
-  
-  if (key_attrs.count("access_key"))
-    passed_key_attrs["id"] = key_attrs["access_key"];
-
-  if (key_attrs.count("secret_key"))
-    passed_key_attrs["key"] = key_attrs["secret"];
-
-  if (key_attrs.count("gen_secret"))
-    passed_key_attrs["gen_secret"] = key_attrs["gen_secret"];
-
-  if (key_attrs.count("subuser"))
-    passed_key_attrs["subuser"] = key_attrs["subuser"];
-
-  if (key_type_specified)
-    passed_key_attrs["key_type"] = found_key_type;
-
-  // get the results of the key op
   switch (op) {
   case GENERATE_KEY:
-    created = generate_key(passed_key_attrs);
-    break;
-  case CREATE_KEY:
-    created = create_key(passed_key_attrs);
+    created = generate_key(req, subprocess_msg);
     break;
   case MODIFY_KEY:
-    created = modify_key(passed_key_attrs);
+    created = modify_key(req, subprocess_msg);
     break;
   }
 
@@ -833,379 +1113,487 @@ bool RGWAccessKeyPool::add(map<string, string> key_attrs, bool defer_save) {
 
   // store the updated info
   if (!defer_save) 
-    ret = rgw_store_user_info(store, user->user_info, false);
+    updated = user->update(err_msg);
 
-    if (ret < 0)
-      return false;
-
+  if (!updated)
+    return false;
 
   return true;
 }
 
-bool RGWAccessKeyPool::remove(map<string, string> key_attrs, bool defer_save) {
+bool RGWAccessKeyPool::add(RGWUserAdminRequest req, std::string &err_msg)
+{
+  bool created;
+  bool checked;
+  bool defer_save = false;
+  std::string subprocess_msg;
 
-  int key_type = KEY_TYPE_S3; // default to S3
-  bool key_type_specified;
-  map<string, RGWAccessKey> *keys_map;
-  map<string, RGWAccessKey>::iterator kiter;
-  string subuser;
-  string access_key;
-
-  if (!keys_allowed)
+  checked = check_request(req, subprocess_msg);
+  if (!checked) {
+    err_msg = "unable to parse request";
     return false;
+  }
 
-  if (key_attrs.count("access_key"))
-    access_key = key_attrs["access_key"];
-
-  if (access_key.empty() && !key_attrs.count("subuser"))
+  created = execute_add(req, subprocess_msg, defer_save);
+  if (!created) {
+    err_msg = "unable to add access key: " + subprocess_msg;
     return false;
+  }
 
-  if (key_attrs.count("subuser"))
-    subuser = key_attrs["subuser"];
+  return true;
+}
 
-  if (key_attrs.count("key_type")) {
-    if (!get_key_type(key_attrs["key_type"], key_type))
-      return false;
+bool RGWAccessKeyPool::execute_remove(RGWUserAdminRequest req, std::string &err_msg, bool defer_save)
+{
+  bool updated =  true;
+  map<std::string, RGWAccessKey>::iterator kiter;
+  map<std::string, RGWAccessKey> *keys_map;
 
-    key_type_specified = true;
+
+  if (!req.existing_key) {
+    err_msg = "unable to find access key";
+    return false;
   }
 
   // one day it will be safe to assume that subusers always have swift keys
-  //if (!subuser.empty())
-  //  key_type = KEY_TYPE_SWIFT
+  //if (req.subuser_specified)
+  //  req.key_type = KEY_TYPE_SWIFT
 
-
-  if (key_type_specified && key_type == KEY_TYPE_SWIFT) {
-    if (subuser.empty())
-      return false;
-    
-    if (access_key.empty()) {
-      access_key = user->user_id;
-      access_key.append(":");
-      access_key.append(subuser);
-    }
-    
-    keys_map = user->swift_keys;
-    
-    kiter = keys_map->find(access_key);
-    if (kiter == keys_map->end())
-      return false;
-  } 
-
-  if (key_type_specified && key_type == KEY_TYPE_S3)  {
-    keys_map = user->access_keys;
-    
-    kiter = keys_map->find(access_key);
-    if (kiter == keys_map->end())
-      return false;
+  if (!req.existing_key) {
+    err_msg = "unable to find access key";
+    return false;
   }
 
-  if (!key_type_specified) {
-    bool found = false;
-    
-
-    if (!found) {
-      keys_map = user->swift_keys;
-      kiter = keys_map->find(access_key);
-
-      if (kiter != keys_map->end())
-        found = true;
-    }
-
-    if (!found) {
-      keys_map = user->access_keys;
-      kiter = keys_map->find(access_key);
-
-      if (kiter != keys_map->end())
-        found = true;
-    }
-    
-    if (!found)
-      return false;
+  if (req.key_type == KEY_TYPE_S3){
+    keys_map = access_keys;
+    kiter = keys_map->find(req.id);
   }
 
-  rgw_remove_key_index(store, kiter->second);
+  else if (req.key_type == KEY_TYPE_SWIFT) {
+    keys_map = swift_keys;
+    kiter = keys_map->find(req.id);
+  }
+
+  int ret = rgw_remove_key_index(store, kiter->second);
+  if (ret < 0) {
+    err_msg = "unable to remove key index";
+    return false;
+  }
+
   keys_map->erase(kiter);
-  if ((rgw_store_user_info(store, user->user_info, false)) < 0) {
-    return false;  
+
+  if (!defer_save)
+    updated =  user->update(err_msg);
+
+  if (!updated)
+    return false;
+
+  return true;
+}
+
+bool RGWAccessKeyPool::remove(RGWUserAdminRequest req, std::string &err_msg)
+{
+  bool checked;
+  bool removed;
+  bool defer_save = false;
+
+  std::string subprocess_msg;
+
+  checked = check_request(req, subprocess_msg);
+  if (!checked) {
+    err_msg = "unable to parse request: " + subprocess_msg;
+    return false;
   }
 
+  removed = execute_remove(req, subprocess_msg, defer_save);
+  if (!removed) {
+    err_msg = "unable to remove subuser: " + subprocess_msg;
+    return false;
+  }
 
   return true;
 }
 
 
-RGWSubUserPool::RGWSubUserPool(RGWUser *user) {
+RGWSubUserPool::RGWSubUserPool(RGWUser *user)
+{
+  if (!user || user->failure) {
+    subusers_allowed = false;
+    return;
+  }
 
-  if (!user) {
-      subusers_allowed = false;
-      return;
-    }
+  store = user->store;
 
-    store = user->store;
+  if (user->user_id == RGW_USER_ANON_ID || !user->populated) {
+    subusers_allowed = false;
+    return;
+  }
 
-    // if the user id hasn't been set the user id hasn't been initialized yet or is anonymous
-    if (user->user_id == RGW_USER_ANON_ID) {
-      subusers_allowed = false;
-      return;
-    }
-
-    user_id = user->user_id;
+  user_id = user->user_id;
 
   subuser_map = &(user->user_info.subusers);
 }
 
-bool RGWSubUserPool::add(map<string, string> params, bool defer_update) {
-  string name;
-  string perm_mask_str;
-  map<string, string> key_attr;
-  bool defer_save = true;
-  int ret = 0;
-  uint32_t perm_mask = 0;
+RGWSubUserPool::~RGWSubUserPool()
+{
+
+}
+
+bool RGWSubUserPool::exists(std::string subuser)
+{
+  if (!subuser_map)
+    return false;
+
+  if (subuser_map->count(subuser))
+    return true;
+
+  return false;
+}
+
+bool RGWSubUserPool::check_request(RGWUserAdminRequest req,\
+        std::string &err_msg)
+{
+  bool checked = true;
+  bool found;
+  string subprocess_msg;
+
+  if (!user->populated) {
+    found = user->init(req);
+    if (!found) {
+      err_msg = "unable to initialize user";
+      return false;
+    }
+  }
+
+  if (!req.subuser_specified) {
+    err_msg = "no subuser specified";
+    return false;
+  }
+
+  if (req.subuser.empty()) {
+    err_msg = "empty subuser name";
+    return false;
+  }
+
+  // check if the subuser exists
+  req.existing_subuser = exists(req.subuser);
+
+  // handle key requests
+  bool key_op = (req.gen_secret || req.key_specified || req.purge_keys);
+  if ( key_op && req.existing_subuser) {
+    std::string access_key = user->user_id;
+    access_key.append(":");
+    access_key.append(req.subuser);
+
+    // one day force subusers to have swift keys
+    //req.key_type = KEY_TYPE_SWIFT;
+
+    if (!req.id_specified)
+      req.id = access_key;
+
+    checked = user->keys->check_request(req, err_msg);
+    if (checked)
+      return false;
+  }
+
+  if (!subusers_allowed) {
+    err_msg = "subusers not allowed for this user";
+    return false;
+  }
+
+  return true;
+}
+
+bool RGWSubUserPool::execute_add(RGWUserAdminRequest req,\
+        std::string &err_msg, bool defer_save)
+{
+  bool defer_key_save = true;
+  bool updated = true;
+  std::string subprocess_msg;
 
   RGWSubUser subuser;
 
-  if (!params.count("subuser"))
-      return false;
-
-  name = params["subuser"];
-  if (name.empty())
-    return false;
-
   // no duplicates
-  if (user->user_info.subusers.count("subuser"))
+  if (req.existing_subuser) {
+    err_msg = "subuser exists";
     return false;
-
-  // generate keys if need be
-  if (params.count("gen_secret")) {
-    key_attr["subuser"] = name;
-    key_attr["key_type"] = "swift";
   }
 
-  if (!user->keys->add(key_attr, defer_save))
-    return false;
+  if (req.key_specified || req.gen_secret) {
+    bool keys_added = user->keys->execute_add(req, subprocess_msg, defer_key_save);
+    if (!keys_added) {
+      err_msg = "unable to create subuser key: " + subprocess_msg;
+      return false;
+    }
+  }
 
   // create the subuser
-  subuser.name = name;
+  subuser.name = req.subuser;
 
-  if (params.count("access")) {
-    if (stringtoul(params["access"].c_str(), &perm_mask) < 0)
-      return false;
-
-    subuser.perm_mask = perm_mask;
-  }
+  if (req.perm_specified)
+    subuser.perm_mask = req.perm_mask;
 
   // insert the subuser into user info
-  user->user_info.subusers[name] = subuser;
-
-  // attempt to save the subuser
-  if (!defer_update) 
-    ret = rgw_store_user_info(store, user->user_info, false);
-
-  if (ret < 0)
-    return false;
-
-  return true;
-}
-
-bool RGWSubUserPool::remove(map<string, string> params, bool defer_update) {
-
-  bool purge_keys = false;
-  string name;
-  int ret = 0;
-
-  map<string, string> key_attrs;
-  map<string, RGWSubUser> subuser_map;
-  map<string, RGWSubUser>::iterator siter;
-
-
-  if (!params.count("subuser"))
-    return false;
-
-  name = params["subuser"];
-  if (name.empty())
-    return false;
-
-
-  siter = subuser_map.find(name); 
-  if (siter == subuser_map.end())
-    return false;
-
-  if (params.count("purge_keys"))
-    purge_keys = str_to_bool(params["purge_keys"].c_str(), 0);
-    
-    if (purge_keys) {
-      string access_key = user->user_id;
-      access_key.append(":");
-      access_key.append(name);
-
-      key_attrs["access_key"] = access_key;
-      key_attrs["key_type"] = "swift";
-
-      bool success = user->keys->remove(key_attrs,false);
-      if (!success)
-        return false;
-    }
-  
-  //remove the subuser from the user info
-  subuser_map.erase(siter);
-
-  // attempt to save the subuser
-  if (!defer_update) 
-    ret = rgw_store_user_info(store, user->user_info, false);
-
-  if (ret < 0)
-    return false;
-
-  return true;
-}
-
-bool RGWSubUserPool::modify(map<string, string> params, bool defer_save) {
-  string name;
-  string perm_mask_str;
-  map<string, string> key_attr;
-  map<string, RGWSubUser> subuser_map;
-  uint32_t perm_mask = 0;
-  int ret;
-
-  RGWSubUser *subuser;
-
-  if (!params.count("subuser"))
-    return false;
-
-  name = params["subuser"];
-  if (name.empty())
-    return false;
-
-  subuser_map =  user->user_info.subusers;
-
-  if (!subuser_map.count("name"))
-    return false;
-
-  subuser = &subuser_map[name];
-
-  if (params.count("gen_secret") || params.count("secret_key")) {
-    string access_key = user->user_id;
-    access_key.append(":");
-    access_key.append(name);
-    
-    key_attr["access_key"] = access_key;
-  }
-
-  if (params.count("gen_secret"))
-    key_attr["gen_secret"] = params["gen_secret"];
-
-  if (params.count("secret_key"))
-    key_attr["secret_key"] = params["secret_key"];
-  
-  // one day it will be safe to assume that subusers only have swift keys
-  //key_attr["key_type"] = swift;
-  
-  bool success = user->keys->add(key_attr, true);
-  if (!success)
-    return false;
-
-  if (params.count("access")) {
-    if (stringtoul(params["access"], &perm_mask) < 0)
-      return false;
-
-    subuser->perm_mask = perm_mask;
-  }
+  std::pair<std::string, RGWSubUser> subuser_pair;
+  subuser_pair  = make_pair(req.subuser, subuser);
+  subuser_map->insert(subuser_pair);
 
   // attempt to save the subuser
   if (!defer_save)
-    ret = rgw_store_user_info(store, user->user_info, false);
+    updated = user->update(err_msg);
 
-  if (ret < 0)
+  if (!updated)
     return false;
 
   return true;
 }
 
+bool RGWSubUserPool::add(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string subprocess_msg;
+  bool checked;
+  bool created;
+  bool defer_save = false;
 
-RGWUserCapPool::RGWUserCapPool(RGWUser *user) {
+  checked = check_request(req, subprocess_msg);
+  if (!checked) {
+    err_msg = "unable to parse request: " + subprocess_msg;
+    return false;
+  }
 
-  if (!user) {
-      caps_allowed = false;
-      return;
+  created = execute_add(req, subprocess_msg, defer_save);
+  if (!created) {
+    err_msg = "unable to create subuser: " + subprocess_msg;
+    return false;
+  }
+
+  return true;
+}
+
+bool RGWSubUserPool::execute_remove(RGWUserAdminRequest req,\
+        std::string &err_msg, bool defer_save)
+{
+  bool updated = true;
+  std::string subprocess_msg;
+
+  map<std::string, RGWSubUser>::iterator siter;
+  RGWUserAdminRequest key_request;
+
+  if (!req.existing_subuser)
+    err_msg = "subuser not found: " + req.subuser;
+
+
+  if (req.purge_keys) {
+    bool removed = user->keys->execute_remove(req, subprocess_msg, false);
+    if (!removed) {
+      err_msg = "unable to remove subuser keys: " + subprocess_msg;
+      return false;
     }
+  }
 
-    // if the user id hasn't been set the user id hasn't been initialized yet or is anonymous
-    if (user->user_id == RGW_USER_ANON_ID) {
-      caps_allowed = false;
-      return;
-    }
+  //remove the subuser from the user info
+  subuser_map->erase(siter);
+
+  // attempt to save the subuser
+  if (!defer_save)
+    updated = user->update(err_msg);
+
+  if (!updated)
+    return false;
+
+  return true;
+}
+
+bool RGWSubUserPool::remove(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string subprocess_msg;
+  bool checked;
+  bool removed;
+  bool defer_save = false;
+
+  checked = check_request(req, subprocess_msg);
+  if (!checked) {
+    err_msg = "unable to parse request: " + subprocess_msg;
+    return false;
+  }
+
+  removed = execute_remove(req, subprocess_msg, defer_save);
+  if (!removed) {
+    err_msg = "unable to remove subuser: " + subprocess_msg;
+    return false;
+  }
+
+  return true;
+}
+
+bool RGWSubUserPool::execute_modify(RGWUserAdminRequest req, std::string &err_msg, bool defer_save)
+{
+  bool updated = true;
+  std::string subprocess_msg;
+  std::map<std::string, RGWSubUser>::iterator siter;
+  std::pair<std::string, RGWSubUser> subuser_pair;
+
+  RGWSubUser subuser;
+
+  if (!req.existing_subuser) {
+    err_msg = "subuser does not exist";
+    return false;
+  }
+
+  subuser_pair.first = req.subuser;
+
+  siter = subuser_map->find(req.subuser);
+  subuser = siter->second;
+
+  bool success = user->keys->execute_add(req, subprocess_msg, true);
+  if (!success) {
+    err_msg = "unable to create subuser keys: " + subprocess_msg;
+    return false;
+  }
+
+  if (req.perm_specified)
+    subuser.perm_mask = req.perm_mask;
+
+  subuser_pair.second = subuser;
+  subuser_map->insert(subuser_pair);
+
+  // attempt to save the subuser
+  if (!defer_save)
+    updated = user->update(err_msg);
+
+  if (!updated)
+    return false;
+
+  return true;
+}
+
+bool RGWSubUserPool::modify(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string subprocess_msg;
+  bool checked;
+  bool modified;
+  bool defer_save = false;
+
+  RGWSubUser subuser;
+
+  checked = check_request(req, subprocess_msg);
+  if (!checked) {
+    err_msg = "unable to parse request: " + subprocess_msg;
+    return false;
+  }
+
+  modified = execute_modify(req, subprocess_msg, defer_save);
+  if (!modified) {
+    err_msg = "unable to modify subuser: " + subprocess_msg;
+    return false;
+  }
+
+  return true;
+}
+
+
+RGWUserCapPool::RGWUserCapPool(RGWUser *user)
+{
+  if (!user || user->failure) {
+    caps_allowed = false;
+    return;
+  }
+
+  if (user->user_id == RGW_USER_ANON_ID || !user->populated) {
+    caps_allowed = false;
+    return;
+  }
 
   caps = &(user->user_info.caps);
+}
+
+RGWUserCapPool::~RGWUserCapPool()
+{
 
 }
 
-bool RGWUserCapPool::add(const string& cap)
+bool RGWUserCapPool::add(RGWUserAdminRequest req, std::string &err_msg)
 {
+  bool found;
+  bool updated;
+  std::string subprocess_msg;
 
-  // eventually replace add_from_string with this function
-  int r = caps->add_from_string(cap);
-  if (r < 0)
+  if (!user->populated) {
+    found = user->init(req);
+    if (!found) {
+      err_msg = "unable to initialize user";
+      return false;
+    }
+  }
+
+  if (!caps_allowed) {
+    err_msg = "caps not allowed for this user";
     return false;
+  }
 
+  if (req.caps.empty()) {
+    err_msg = "empty user caps";
+    return false;
+  }
+
+  int r = caps->add_from_string(req.caps);
+  if (r < 0) {
+    err_msg = "unable to add caps: " + req.caps;
+    return false;
+  }
+
+  updated = user->update(err_msg);
+  if (!updated)
+    return false;
 
   return true;
 }
 
-bool RGWUserCapPool::remove(const string& cap)
+bool RGWUserCapPool::remove(RGWUserAdminRequest req, std::string &err_msg)
 {
+  bool found;
+  bool updated;
+  std::string subprocess_msg;
 
-  // eventually replace remove_from_string with this function
-  int r = caps->remove_from_string(cap);
-  if (r < 0)
+  if (!user->populated) {
+    found = user->init(req);
+    if (!found) {
+      err_msg = "unable to initialize user";
+      return false;
+    }
+  }
+
+  if (!caps_allowed) {
+    err_msg = "caps not allowed for this user";
+    return false;
+  }
+
+  if (req.caps.empty()) {
+    err_msg = "empty user caps";
+    return false;
+   }
+
+  int r = caps->remove_from_string(req.caps);
+  if (r < 0) {
+    err_msg = "unable to remove caps: " + req.caps;
+    return false;
+  }
+
+  updated = user->update(err_msg);
+  if (!updated)
     return false;
 
   return true;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-RGWUser::RGWUser(RGWRados *_store, pair<string, string> user) {
+RGWUser::RGWUser(RGWRados *_store, pair<int, std::string> id)
+{
   if (!_store)
     return;
 
   store = _store;
-  //int ret;
 
-//  switch (id_type) {
-//  case RGW_USER_ID_UID:
-//    if (!id_value.empty())
-//      ret = rgw_get_user_info_by_uid(store, id_value, user_info);
-//    break;
-//  case RGW_USER_ID_EMAIL:
-//    if (!id_value.empty())
-//      ret = rgw_get_user_info_by_email(store, id_value, user_info);
-//    break;
-//  case RGW_USER_ID_SWIFT_NAME:
-//    if (!id_value.empty())
-//      ret = rgw_get_user_info_by_swift(store, id_value, user_info);
-//    break;
-//  case RGW_USER_ID_ACCESS_KEY:
-//    if (!id_value.empty())
-//      ret = rgw_get_user_info_by_access_key(store, id_value, user_info);
-//    break;
-//  case RGW_ANONYMOUS_USER:
-//    rgw_get_anon_user(user_info);
-//    break;
-//  }
-
-
-  access_keys = &(user_info.swift_keys);
-  swift_keys = &(user_info.swift_keys);
+  init(id);
 
   /* API wrappers */
   keys = new RGWAccessKeyPool(this);
@@ -1214,8 +1602,33 @@ RGWUser::RGWUser(RGWRados *_store, pair<string, string> user) {
 
 }
 
+RGWUser::RGWUser(RGWRados *_store, RGWUserAdminRequest req)
+{
+  if (!_store)
+    return;
 
-RGWUser::RGWUser(RGWRados *_store ) {
+  store = _store;
+
+  init(req);
+
+  /* API wrappers */
+  keys = new RGWAccessKeyPool(this);
+  caps = new RGWUserCapPool(this);
+  subusers = new RGWSubUserPool(this);
+
+}
+
+RGWUser::~RGWUser()
+{
+
+  // clean up some allocated memory
+  delete keys;
+  delete caps;
+  delete subusers;
+}
+ 
+RGWUser::RGWUser(RGWRados *_store)
+{
   if (!_store) {
     set_failure();
     return;
@@ -1225,163 +1638,478 @@ RGWUser::RGWUser(RGWRados *_store ) {
   return;
 }
 
-RGWUser::RGWUser() {
+RGWUser::RGWUser()
+{
   rgw_get_anon_user(user_info);
 
   return;
 }
 
-bool RGWUser::add(map<string,string> attrs) {
-  bool keys_provided = false;
+bool RGWUser::init(pair<int, string> id)
+{
+  std::string id_value = id.second;
+  bool found = false;
 
-  // need function to create default keys in map
-  map<string, string> temp_attrs;
-
-  if (!attrs.count("user_id"))
-    return false;
-
-  temp_attrs["user_id"] = attrs["user_id"];
-
-  if (!attrs.count("display_name"))
-    return false;
-
-  temp_attrs["display_name"] = attrs["display_name"];
-
-  if (attrs.count("user_email"))
-    temp_attrs["user_email"] = attrs["user_email"];
-
-  if (attrs.count("access_key") && attrs.count("secret_key")) {
-    keys_provided = true;
-    temp_attrs["access_key"] = attrs["access_key"];
-    temp_attrs["secret_key"] = attrs["secret_key"];
+  switch (id.first) {
+  case RGW_USER_ID:
+    if (!id_value.empty())
+      found = (rgw_get_user_info_by_uid(store, id_value, user_info) >= 0);
+    break;
+  case RGW_USER_EMAIL:
+    if (!id_value.empty())
+      found = (rgw_get_user_info_by_email(store, id_value, user_info) >= 0);
+    break;
+  case RGW_SWIFT_USERNAME:
+    if (!id_value.empty())
+      found = (rgw_get_user_info_by_swift(store, id_value, user_info) >= 0);
+    break;
+  case RGW_ACCESS_KEY:
+    if (!id_value.empty())
+      found = (rgw_get_user_info_by_access_key(store, id_value, user_info) >= 0);
+    break;
   }
 
+  if (!found) {
+    set_failure();
+    return false;
+  }
 
+  user_id = user_info.user_id;
+  populated = true;
+  old_info = user_info;
 
-  //int ret = rgw_store_user_info(store, user_info, bool exclusive);
+  // this may have been called by a helper object
+  if (keys && user_id != RGW_USER_ANON_ID)
+    keys->keys_allowed = true;
+
+  if(subusers && user_id != RGW_USER_ANON_ID)
+    subusers->subusers_allowed = true;
+
+  if (caps && user_id != RGW_USER_ANON_ID)
+    caps->caps_allowed = true;
 
   return true;
 }
 
+bool RGWUser::init(RGWUserAdminRequest req)
+{
+  bool found = false;
+  std::string swift_user;
+  if (!req.user_id.empty() && !req.subuser.empty())
+    swift_user = req.user_id + ":" + req.subuser;
 
-bool RGWUser::remove(map<string, string> params) {
+  if (!req.user_id.empty())
+    found = (rgw_get_user_info_by_uid(store, req.user_id, user_info) >= 0);
+
+  if (!req.user_email.empty() && !found)
+    found = (rgw_get_user_info_by_email(store, req.user_email, user_info) >= 0);
+  
+  // check that this is correct
+  if (!req.subuser.empty() && !found)
+    found = (rgw_get_user_info_by_swift(store, swift_user, user_info) >= 0);
+
+  if (!req.id.empty())
+    found = (rgw_get_user_info_by_access_key(store, req.id, user_info) >= 0);
+
+  if (!found) {
+    set_failure();
+    return false;
+  }
+
+  user_id = user_info.user_id;
+  populated = true;
+  old_info = user_info;
+
+  // this may have been called by a helper object
+  if (keys && user_id != RGW_USER_ANON_ID)
+    keys->keys_allowed = true;
+
+  if(subusers && user_id != RGW_USER_ANON_ID)
+    subusers->subusers_allowed = true;
+
+  if (caps && user_id != RGW_USER_ANON_ID)
+    caps->caps_allowed = true;
+
+  return true;
+}
+
+bool RGWUser::update(std::string &err_msg)
+{
+  int ret;
+  std::string subprocess_msg;
+
+  if (!store)
+    return false;
+
+  if (!populated)
+    return false;
+
+  ret = remove_old_indexes(store, old_info, user_info, subprocess_msg);
+  if (ret < 0) {
+    err_msg = "unable to remove old user info: " + subprocess_msg;
+    return false;
+  }
+
+  ret = rgw_store_user_info(store, user_info, false);
+  if (ret < 0) {
+    err_msg = "unable to store user info";
+    return false;
+  }
+
+  return true;
+}
+
+bool RGWUser::check_request(RGWUserAdminRequest req, std::string &err_msg)
+{
+  int ret;
+  std::string subprocess_msg;
+
+  RGWUserInfo duplicate_info;
+
+  if (req.user_id.empty() && !populated) {
+    err_msg = "no user id provided";
+    return false;
+  }
+
+  if (populated && (req.user_id != user_id)) {
+    err_msg = "user id mismatch, requested id: " + req.user_id\
+            + "does not match: " + user_id;
+
+    return false;
+  }
+
+  if (!req.user_email.empty())
+    req.user_email_specified = true;
+
+  if (!req.display_name.empty())
+    req.display_name_specified = true;
+
+  if (req.perm_mask > 0)
+    req.perm_specified = true;
+
+  if (req.is_suspended != user_info.suspended)
+    req.suspension_op = true;
+
+  // for max_buckets == 0, will have to manually set
+  if (req.max_buckets > 0)
+    req.max_buckets_specified = true;
+
+  /*
+   * keys->check_request() will have to be called separately
+   * in the case of user creation
+   */
+  if ((req.gen_secret || !req.id.empty()) && populated) {
+    bool checked = keys->check_request(req, err_msg);
+    if (!checked)
+      return false;
+  }
+
+  // check if the user exists already
+  ret = rgw_get_user_info_by_uid(store, req.user_id, duplicate_info);
+  req.existing_user = (ret >= 0);
+
+  return true;
+}
+
+bool RGWUser::execute_add(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string subprocess_msg;
+  RGWUserAdminRequest key_request;
+  bool updated = true;
+  bool defer_save = true;
+
+  // fail if the user_info has already been populated
+  if (populated)
+    return false;
+
+  // fail if the user exists already
+  if (req.existing_user)
+    return false;
+
+  // fail if the display name was not included
+  if (!req.display_name_specified) {
+    err_msg = "no display name specified";
+    return false;
+  } 
+
+  // set the user info
+  user_info.user_id = req.user_id;
+  user_info.display_name = req.display_name;
+
+  if (req.user_email_specified)
+    user_info.user_email = req.user_email;
+
+  if (req.max_buckets_specified)
+    user_info.max_buckets = req.max_buckets;
+
+  populated = true;
+
+  // see if we need to add an access key
+  if (req.gen_access || req.id_specified) {
+    bool checked = keys->check_request(req, subprocess_msg);
+    if (!checked) {
+      err_msg = "unable to create create access key: " + subprocess_msg;
+      return false;
+    }
+
+    bool success = keys->execute_add(req, subprocess_msg, defer_save);
+    if (!success) {
+      err_msg = "unable to create access key: " + subprocess_msg;
+      return false;
+    }
+  }
+
+  updated = update(err_msg);
+  if (!updated)
+    return false;
+
+  return true;
+}
+
+bool RGWUser::add(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string subprocess_msg;
+
+  bool checked = check_request(req, subprocess_msg);
+  if (!checked) {
+    err_msg = "unable to parse parameters: " + subprocess_msg;
+    return false;
+  }
+
+  bool created = execute_add(req, subprocess_msg);
+  if (!created) {
+    err_msg = "unable to create user: " + subprocess_msg;
+    return false;
+  }
+
+  return true;
+}
+
+bool RGWUser::execute_remove(RGWUserAdminRequest req, std::string &err_msg)
+{
   RGWUserBuckets buckets;
 
-  string uid;
-  string purge_data_str;
   int ret;
-  bool purge_data = false;
 
-  if (params.count("user_id"))
-    uid = params["user_id"];
+  if (!req.existing_user)
+    return false;
 
-  if (uid.empty())
-    uid = user_id;
-
-  if (params.count("purge_data"))
-    purge_data_str = params["purge_data"];
-
-  if (strcasecmp(purge_data_str.c_str(), "true"))
-    purge_data = true;
-
-
-
-  if (rgw_read_user_buckets(store, user_id, buckets, false) >= 0) {
-    map<string, RGWBucketEnt>& m = buckets.get_buckets();
-
-    if (m.size() > 0 && purge_data) {
-      for (std::map<string, RGWBucketEnt>::iterator it = m.begin(); it != m.end(); it++) {
-        ret = remove_bucket(store, ((*it).second).bucket, true);
-
-        if (ret < 0)
-          return false;
-      }
-    }
-
-    if (m.size() > 0 && !purge_data) {
-      //cerr << "ERROR: specify --purge-data to remove a user with a non-empty bucket list" << std::endl;
+  // purge the data first
+  if (req.purge_data) {
+    ret = rgw_read_user_buckets(store, user_id, buckets, false);
+    if (ret < 0) {
+      err_msg = "unable to read user data";
       return false;
     }
+
+    map<std::string, RGWBucketEnt>& m = buckets.get_buckets();
+    
+    if (m.size() > 0) {
+      std::map<std::string, RGWBucketEnt>::iterator it;
+      for (it = m.begin(); it != m.end(); it++) {
+        ret = remove_bucket(store, ((*it).second).bucket, true);
+
+         if (ret < 0) {
+           err_msg = "unable to delete user data"; 
+           return false;
+         }
+      }
+    }
   }
-  rgw_delete_user(store, user_info);
+
+  ret = rgw_delete_user(store, user_info);
+  if (ret < 0) {
+    err_msg = "unable to remove user";
+    return false;
+  }
 
   return true;
 }
 
-bool RGWUser::modify(map<string,string> attrs) {
-  map<string, string> subuser_attrs;
-  map<string, string> key_attrs;
-  string cap;
+bool RGWUser::remove(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string subprocess_msg;
+  
+  bool checked = check_request(req, subprocess_msg);
+  if (!checked) {
+    err_msg = "unable to parse parameters: " + subprocess_msg;
+    return false;
+  }
 
+  bool removed = execute_remove(req, subprocess_msg);
+  if (!removed) {
+    err_msg = "unable to create user: " + subprocess_msg;
+    return false;
+  }
 
+  return true;
+}
+
+bool RGWUser::execute_modify(RGWUserAdminRequest req, string &err_msg)
+{
+  int email_check;
+  bool same_email;
+
+  bool defer_save = true;
+  bool updated = true;
+  int ret = 0;
+  std::string subprocess_msg;
+
+  RGWUserInfo duplicate_check;
+ 
   // ensure that the user info has been populated or is populate-able
-  if (!attrs.count("user_id") && user_id == RGW_USER_ANON_ID)
+  if (!req.existing_user && !populated) {
+    err_msg = "user not found";
     return false;
+  }
 
-  // if the user_id was passed in, try and populate the internal user info from it
-  if (attrs.count("user_id") && user_id == RGW_USER_ANON_ID)
-    user_id = attrs["user_id"];
-
-  // if the user info hasn't already been populated...attempt to
-  int ret = rgw_get_user_info_by_uid(store, user_id, user_info);
-
-  if (user_id == RGW_USER_ANON_ID && ret < 0)
+  // ensure that we can modify the user's attributes
+  if (user_id == RGW_USER_ANON_ID) {
+    err_msg = "unable to modify anonymous user's info";
     return false;
+  }
+
+  // if the user hasn't already been populated...attempt to
+  if (!populated) {
+    bool found = init(req);
+
+    if (!found) {
+      err_msg = "unable to retrieve user info";
+      return false;
+    }
+  }
+
+  email_check = strcmp(req.user_email.c_str(), user_info.user_email.c_str());
+  same_email = (email_check== 0);
 
   // make sure we are not adding a duplicate email
-  RGWUserInfo duplicate_check;
-  if (attrs.count("email")) {
-    if (rgw_get_user_info_by_email(store, attrs["email"], duplicate_check) >= 0)
+  if (req.user_email_specified && !same_email) {
+    ret = rgw_get_user_info_by_email(store, req.user_email, duplicate_check);
+    if (ret >= 0) {
+      err_msg = "cannot add duplicate email"; 
       return false;
+    }
 
-    user_info.user_email = attrs["email"];
+    user_info.user_email = req.user_email;
   }
 
   // update the remaining user info
-  if (attrs.count("display_name"))
-    user_info.display_name = attrs["display_name"];
+  if (req.display_name_specified)
+    user_info.display_name = req.display_name;
 
-  if (attrs.count("max_buckets"))
-    stringtoul(attrs["max_buckets"], &user_info.max_buckets);
+  if (req.max_buckets_specified)
+    user_info.max_buckets = req.max_buckets;
 
+  if (req.suspension_op) {
+  
+    string id;
 
-  if (attrs.count("suspended")) {
-    __u8 is_suspended;
+    RGWUserBuckets buckets;
+    if (rgw_read_user_buckets(store, user_id, buckets, false) < 0) {
+      err_msg = "could not get buckets for uid:  " + user_id;
+      return false;
+    }
+    map<string, RGWBucketEnt>& m = buckets.get_buckets();
+    map<string, RGWBucketEnt>::iterator iter;
 
-    is_suspended = rgw_str_to_bool(attrs["suspended"].c_str(), 0);
-    user_info.suspended = is_suspended;
+    vector<rgw_bucket> bucket_names;
+    for (iter = m.begin(); iter != m.end(); ++iter) {
+      RGWBucketEnt obj = iter->second;
+      bucket_names.push_back(obj.bucket);
+    }
+    ret = store->set_buckets_enabled(bucket_names, !req.is_suspended);
+    if (ret < 0) {
+     err_msg = "failed to change pool";
+      return false;
+    }
   }
 
+  // if we're supposed to modify keys, do so 
+  if (req.gen_access || req.id_specified || req.gen_secret || req.key_specified) {
 
-  // modify subusers
+    // the key parameters were already checked
+    bool success = keys->execute_add(req, subprocess_msg, defer_save);
+    if (!success) {
+      err_msg = "unable to create or modify keys: " + subprocess_msg;
+      return false;
+    }
+  }
 
-  // modify caps
-
-  // modify keys
+  updated = update(err_msg);
+  if (!updated)
+    return false;
 
   return true;
-
-}
-
-bool RGWUser::info(map<string, string> id, RGWUserInfo &fetched_info) {
-
-  if (id.count("user_id")) {
-    if (rgw_get_user_info_by_uid(store, id["user_id"], fetched_info) >= 0)
-      return true;
-  }
-
-  if (id.count("email")) {
-    if (rgw_get_user_info_by_email(store, id["email"], fetched_info) >= 0)
-      return true;
-  }
-
-  if (id.count("access_key")) {
-    if (rgw_get_user_info_by_access_key(store, id["email"], fetched_info) >= 0)
-      return true;
-  }
-
-  return false;
 }
 
 
+bool RGWUser::modify(RGWUserAdminRequest req, std::string &err_msg)
+{
+  std::string subprocess_msg;
+  
+  bool checked = check_request(req, subprocess_msg);
+  if (!checked) {
+    err_msg = "unable to parse parameters: " + subprocess_msg;
+    return false;
+  }
+
+  bool modified = execute_modify(req, subprocess_msg);
+  if (!modified) {
+    err_msg = "unable to modify user: " + subprocess_msg;
+    return false;
+  }
+
+  return true;
+}
+
+bool RGWUser::info(std::pair<uint32_t, std::string> id, RGWUserInfo &fetched_info, std::string &err_msg)
+{
+  std::string id_value = id.second;
+
+  bool found = init(id);
+
+  if (!found) {
+    err_msg = "unable to fetch user info";
+    return false;
+  }
+
+  // return the user info
+  fetched_info = user_info;
+
+  return true;
+}
+
+bool RGWUser::info(RGWUserAdminRequest req, RGWUserInfo &fetched_info, std::string &err_msg)
+{
+  bool found = init(req);
+
+  if (!found) {
+    err_msg = "unable to fetch user info";
+    return false;
+  }
+
+  // return the user info
+  fetched_info = user_info;
+
+  return true;
+}
+
+bool RGWUser::info(RGWUserInfo &fetched_info, std::string &err_msg)
+{
+  if (!populated) {
+    err_msg = "no user info";
+    return false;
+  }
+
+  if (failure) {
+   err_msg = "previous error detected...aborting";
+   return false;
+  }
+
+
+  // return the user info
+  fetched_info = user_info;
+
+  return true;
+}
 

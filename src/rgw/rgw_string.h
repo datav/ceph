@@ -98,6 +98,7 @@ static inline int str_to_bool(const char *s, int def_val)
 
   return (strcasecmp(s, "on") == 0 ||
           strcasecmp(s, "yes") == 0 ||
+          strcasecmp(s, "true") == 0 ||
           strcasecmp(s, "1") == 0);
 }
 

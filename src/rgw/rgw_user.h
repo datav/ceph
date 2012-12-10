@@ -152,125 +152,84 @@ extern int rgw_remove_uid_index(RGWRados *store, string& uid);
 extern int rgw_remove_email_index(RGWRados *store, string& email);
 extern int rgw_remove_swift_name_index(RGWRados *store, string& swift_name);
 
-enum
-{
-  RGW_USER_ID_UID,
-  RGW_USER_ID_EMAIL,
-  RGW_USER_ID_SWIFT_NAME,
-  RGW_USER_ID_ACCESS_KEY,
-  RGW_ANONYMOUS_USER
-};
+
+/* remove these when changes complete */
+extern bool validate_access_key(string& key);
+extern int remove_object(RGWRados *store, rgw_bucket& bucket, std::string& object);
+extern int remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children);
+
+
+/* end remove these */
+/*
+ * An RGWUser class along with supporting classes created
+ * to support the creation of an RESTful administrative API
+ */
 
 enum ObjectKeyType {
   KEY_TYPE_SWIFT,
   KEY_TYPE_S3,
 };
 
-static bool char_is_unreserved_url(char c)
-{
-  if (isalnum(c))
-    return true;
+enum RGWKeyPoolOp {
+  CREATE_KEY,
+  GENERATE_KEY,
+  MODIFY_KEY
+};
 
-  switch (c) {
-  case '-':
-  case '.':
-  case '_':
-  case '~':
-    return true;
-  default:
-    return false;
-  }
-}
+enum RGWUserId {
+  RGW_USER_ID,
+  RGW_SWIFT_USERNAME,
+  RGW_USER_EMAIL,
+  RGW_ACCESS_KEY,
+};
 
-static bool validate_access_key(string& key)
-{
-  const char *p = key.c_str();
-  while (*p) {
-    if (!char_is_unreserved_url(*p))
-      return false;
-    p++;
-  }
-  return true;
-}
-
-static int remove_object(RGWRados *store, rgw_bucket& bucket, std::string& object)
-{
-  int ret = -EINVAL;
-  RGWRadosCtx *rctx = new RGWRadosCtx(store);
-  rgw_obj obj(bucket,object);
-
-  ret = store->delete_obj(rctx, obj);
-
-  return ret;
-}
-
-static int remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children)
-{
-  int ret;
-  map<RGWObjCategory, RGWBucketStats> stats;
-  std::vector<RGWObjEnt> objs;
-  std::string prefix, delim, marker, ns;
-  map<string, bool> common_prefixes;
-  rgw_obj obj;
-  RGWBucketInfo info;
-  bufferlist bl;
-
-  ret = store->get_bucket_stats(bucket, stats);
-  if (ret < 0)
-    return ret;
-
-  obj.bucket = bucket;
-  int max = 1000;
-
-  ret = rgw_get_obj(store, NULL, store->params.domain_root, bucket.name, bl, NULL);
-
-  bufferlist::iterator iter = bl.begin();
-  try {
-    ::decode(info, iter);
-  } catch (buffer::error& err) {
-    //cerr << "ERROR: could not decode buffer info, caught buffer::error" << std::endl;
-    return -EIO;
-  }
-
-  if (delete_children) {
-    ret = store->list_objects(bucket, max, prefix, delim, marker, objs, common_prefixes,
-                              false, ns, (bool *)false, NULL);
-    if (ret < 0)
-      return ret;
-
-    while (objs.size() > 0) {
-      std::vector<RGWObjEnt>::iterator it = objs.begin();
-      for (it = objs.begin(); it != objs.end(); it++) {
-        ret = remove_object(store, bucket, (*it).name);
-        if (ret < 0)
-          return ret;
-      }
-      objs.clear();
-
-      ret = store->list_objects(bucket, max, prefix, delim, marker, objs, common_prefixes,
-                                false, ns, (bool *)false, NULL);
-      if (ret < 0)
-        return ret;
-    }
-  }
-
-  ret = store->delete_bucket(bucket);
-  if (ret < 0) {
-    //cerr << "ERROR: could not remove bucket " << bucket.name << std::endl;
-
-    return ret;
-  }
-
-  ret = rgw_remove_user_bucket_info(store, info.owner, bucket);
-  if (ret < 0) {
-    //cerr << "ERROR: unable to remove user bucket information" << std::endl;
-  }
-
-  return ret;
-}
+struct RGWUserAdminRequest {
+  
+  // user attributes
+  std::string user_id;
+  std::string user_email;
+  std::string display_name;
+  uint32_t max_buckets;
+  __u8 is_suspended; // not usually set manually
+  std::string caps;
+  
+  // subuser attributes
+  std::string subuser;
+  uint32_t perm_mask;
+  
+  // key_attributes
+  std::string id; // access key
+  std::string key; // secret key
+  int32_t key_type;
+  
+  // operation attributes
+  bool existing_user;
+  bool existing_key;
+  bool existing_subuser;
+  bool subuser_specified;
+  bool purge_keys;
+  bool gen_secret;
+  bool gen_access;
+  bool id_specified;
+  bool key_specified;
+  bool type_specified;
+  bool purge_data;
+  bool display_name_specified;
+  bool user_email_specified;
+  bool max_buckets_specified;
+  bool perm_specified;
+  bool suspension_op;
+  uint32_t key_op;
+};
 
 
-/* new functionality */
+/* 
+ * There shouldn't really be a need to call this function since the RGWUserAdminRequest struct is the 
+ * basis of all RGWUser admin operations, but could be useful for building a request from a strings
+ * pulled from a socket or similar....
+ */
+bool rgw_build_user_request_from_map(map<std::string, std::string> request_parameters, RGWUserAdminRequest &_req);
+
 class RGWUser;
 
 class RGWAccessKeyPool 
@@ -280,22 +239,37 @@ class RGWAccessKeyPool
   RGWRados *store;
   RGWUser *user;
 
+  map<std::string, RGWAccessKey> *swift_keys;
+  map<std::string, RGWAccessKey> *access_keys;
+
   // we don't want to allow keys for the anonymous user or a null user
   bool keys_allowed;
 
 private:
-  bool get_key_type(std::string requested_type, int &dest);
 
-  bool create_key(map<string, string> key_attrs);
-  bool generate_key(map<string, string> key_attrs);
-  bool modify_key(map<string, string> key_attrs);
+  bool create_key(RGWUserAdminRequest req, string &err_msg);
+  bool generate_key(RGWUserAdminRequest req, string &err_msg);
+  bool modify_key(RGWUserAdminRequest req, string &err_msg);
+
+  bool check_existing_key(RGWUserAdminRequest req);
+  bool check_request(RGWUserAdminRequest req, string &err_msg);
+
+  /* API Contract Fulfilment */
+  bool execute_add(RGWUserAdminRequest req, string &err_msg, bool defer_save);
+  bool execute_remove(RGWUserAdminRequest req, string &err_msg, bool defer_save);
+
+  friend class RGWUser;
+  friend class RGWSubUserPool;
 
 public:
 
   RGWAccessKeyPool(RGWUser *user);
+  ~RGWAccessKeyPool();
 
-  bool add(map<string, string> key_attrs, bool defer_save);
-  bool remove(map<string, string> key_attrs, bool defer_save);
+
+  /* API Contracted Methods */
+  bool add(RGWUserAdminRequest, string &err_msg);
+  bool remove(RGWUserAdminRequest, string &err_msg);
 };
 
 class RGWSubUserPool
@@ -307,46 +281,31 @@ class RGWSubUserPool
 
   map<string, RGWSubUser> *subuser_map;
 
+private:
+  bool check_request(RGWUserAdminRequest req, string &err_msg);
+
+  /* API Contract Fulfilment */
+  bool execute_add(RGWUserAdminRequest req, string &err_msg, bool defer_save);
+  bool execute_remove(RGWUserAdminRequest req, string &err_msg, bool defer_save);
+  bool execute_modify(RGWUserAdminRequest req, string &err_msg, bool defer_save);
+
 public:
+  bool exists(std::string subuser);
 
   RGWSubUserPool(RGWUser *rgw_user);
+  ~RGWSubUserPool();
 
-  bool add(map<string, string> params, bool defer_save);
-  bool remove(map<string, string> params, bool defer_save);
-  bool modify(map<string, string> params, bool defer_save);
+  /* API contracted methods */
+  bool add(RGWUserAdminRequest req, string &err_msg);
+  bool remove(RGWUserAdminRequest req, string &err_msg);
+  bool modify(RGWUserAdminRequest req, string &err_msg);
+
+  friend class RGWUser;
 };
-
-//class RGWUserCaps
-//{
-//  map<string, uint32_t> caps;
-//
-//  int get_cap(const string& cap, string& type, uint32_t *perm);
-//  int parse_cap_perm(const string& str, uint32_t *perm);
-//  int add_cap(const string& cap);
-//  int remove_cap(const string& cap);
-//public:
-//  int add_from_string(const string& str);
-//  int remove_from_string(const string& str);
-//
-//  void encode(bufferlist& bl) const {
-//     ENCODE_START(1, 1, bl);
-//     ::encode(caps, bl);
-//     ENCODE_FINISH(bl);
-//  }
-//  void decode(bufferlist::iterator& bl) {
-//     DECODE_START(1, bl);
-//     ::decode(caps, bl);
-//     DECODE_FINISH(bl);
-//  }
-//  int check_cap(const string& cap, uint32_t perm);
-//  void dump(Formatter *f) const;
-//};
-//WRITE_CLASS_ENCODER(RGWUserCaps);
 
 
 class RGWUserCapPool
 {
-
   RGWUser *user;
   RGWUserCaps *caps;
   bool caps_allowed;
@@ -357,57 +316,64 @@ public:
   RGWUserCapPool(RGWUser *user);
   ~RGWUserCapPool();
 
-  bool add(const string& str);
-  bool remove(const string& str);
+  bool add(RGWUserAdminRequest req, std::string &err_msg);
+  bool remove(RGWUserAdminRequest req, std::string &err_msg);
+
+  friend class RGWUser;
 };
-
-
 
 class RGWUser
 {
 
 private:
   RGWUserInfo user_info;
+  RGWUserInfo old_info;
   RGWRados *store;
-
-  map<string, RGWAccessKey> *access_keys;
-  map<string, RGWAccessKey> *swift_keys;
 
   string user_id;
   bool failure;
+  bool populated;
 
   void set_failure() { failure = true; };
+  bool check_request(RGWUserAdminRequest req, string &err_msg);
+  bool update(std::string &err_msg);
+ 
+  /* API Contract Fulfilment */
+  bool execute_add(RGWUserAdminRequest req, string &err_msg);
+  bool execute_remove(RGWUserAdminRequest req, string &err_msg);
+  bool execute_modify(RGWUserAdminRequest req, string &err_msg);
 
 public:
-  RGWUser(RGWRados *_store, pair<string, string> user);
-  RGWUser(RGWRados *_store );
+  RGWUser(RGWRados *_store, RGWUserAdminRequest req);
+  RGWUser(RGWRados *_store, pair<int, string> user);
+  RGWUser(RGWRados *_store);
   RGWUser();
-  
+  ~RGWUser();
+
+  bool init(pair<int, string> user);
+  bool init(RGWUserAdminRequest req);
+
+
+  bool is_populated() { return populated; };
+  bool has_failed() { return failure; };
+
   /* API Contracted Members */
   RGWUserCapPool *caps;
   RGWAccessKeyPool *keys;
   RGWSubUserPool *subusers;
 
   /* API Contracted Methods */
-  bool add(map<string,string> attrs);
-  bool remove(map<string, string> params);
-  bool modify(map<string,string> attrs);
-  bool info (map<string, string> identification, RGWUserInfo &fetched_info);
+  bool add(RGWUserAdminRequest req, string &err_msg);
+  bool remove(RGWUserAdminRequest req, string &err_msg);
+  bool modify(RGWUserAdminRequest req, string &err_msg);
+  bool info (std::pair<uint32_t, std::string> id, RGWUserInfo &fetched_info, string &err_msg);
+  bool info (RGWUserAdminRequest req, RGWUserInfo &fetched_info, string &err_msg);
+  bool info (RGWUserInfo &fetched_info, string &err_msg);
+
 
   friend class RGWAccessKeyPool;
   friend class RGWSubUserPool;
   friend class RGWUserCapPool;
 };
-
-
-
-
-
-
-
-
-
-
-
 
 #endif
